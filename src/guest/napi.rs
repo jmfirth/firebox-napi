@@ -5376,6 +5376,19 @@ pub fn register_napi_imports(
     };
 
     io.register_namespace(NAPI_MODULE_NAME, napi_namespace);
+    // firebox#352: Edge.js's edgejs.wasm imports the unofficial_napi_*
+    // family under the **core** `napi` namespace (not the dedicated
+    // extension namespace). Mirror the extension exports into `napi`
+    // so the guest binary resolves them at instantiation. The
+    // dedicated `napi_extension_wasmer_v0` registration below is
+    // preserved for callers that import from the extension namespace
+    // directly. Without this bridge, edgejs.webc fails to instantiate
+    // with `Error while importing "napi"."unofficial_napi_create_env":
+    // unknown import`.
+    io.register_namespace(
+        NAPI_MODULE_NAME,
+        napi_extension_wasmer_namespace.clone(),
+    );
     io.register_namespace(
         NAPI_EXTENSION_WASMER_MODULE_NAME,
         napi_extension_wasmer_namespace,

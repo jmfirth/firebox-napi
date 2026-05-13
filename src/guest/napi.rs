@@ -3152,11 +3152,22 @@ fn guest_napi_create_external_arraybuffer(
         return 1;
     };
 
+    // firebox#352 cascade 3: `external_data` is an i32 NAPI argument
+    // carrying a 32-bit WASM guest pointer.  Cast through `as u32` first
+    // so the bit pattern (which may have the high bit set when treated
+    // as i32) is preserved into u64 without sign-extension — a direct
+    // `external_data as u64` of e.g. -1 yields `0xFFFF_FFFF_FFFF_FFFF`,
+    // which then overflows `host_base + ...` in debug builds and panics
+    // out of `extern "C"` (the trampoline was SIGABRT-ing on this
+    // before the catch_unwind landed; the panic is the root cause of
+    // the cascade-3 spawn-chain abort symptom we observed during
+    // `npm install`).  Use `wrapping_add` for release-mode parity with
+    // the original wraparound semantics on bogus input.
     let host_addr: u64 = {
         let (_, store_ref) = env.data_and_store_mut();
         let view = memory.view(&store_ref);
         let host_base = view.data_ptr() as u64;
-        host_base + external_data as u64
+        host_base.wrapping_add(external_data as u32 as u64)
     };
 
     let mut out: u32 = 0;
@@ -3198,11 +3209,15 @@ fn guest_napi_create_external_buffer(
         return 1;
     };
 
+    // firebox#352 cascade 3: see sibling guest_napi_create_external_
+    // arraybuffer above for the sign-extension reason this cast pipes
+    // through `u32` before widening to `u64`.  Same class bug —
+    // guest-pointer arithmetic on an i32 NAPI argument.
     let host_addr: u64 = {
         let (_, store_ref) = env.data_and_store_mut();
         let view = memory.view(&store_ref);
         let host_base = view.data_ptr() as u64;
-        host_base + external_data as u64
+        host_base.wrapping_add(external_data as u32 as u64)
     };
 
     let mut out: u32 = 0;
@@ -5443,4 +5458,65 @@ pub fn register_env_imports(store: &mut impl AsStoreMut, io: &mut Imports) {
         "_Z20OSSL_set_max_threadsP15ossl_lib_ctx_sty",
         guest_env_ossl_set_max_threads
     );
+}
+
+#[cfg(test)]
+mod cascade3_overflow_tests {
+    //! firebox#352 cascade 3 — guest-pointer sign-extension regression.
+    //!
+    //! `guest_napi_create_external_arraybuffer` and `guest_napi_create_
+    //! external_buffer` take a 32-bit guest pointer as the `external_
+    //! data: i32` argument.  Before the cascade-3 fix, both did
+    //! `host_base + external_data as u64`; in debug builds (which `just
+    //! check` exercises) any i32 value with the high bit set
+    //! sign-extends through the `as u64` cast and overflows the
+    //! addition, panicking out of the `extern "C"` callback trampoline.
+    //!
+    //! These tests pin the cast semantics so a future refactor doesn't
+    //! re-introduce the sign-extension bug.
+
+    /// `i32 as u64` sign-extends — the bug shape.
+    #[test]
+    fn raw_i32_to_u64_sign_extends() {
+        // -1_i32 as u64 → 0xFFFF_FFFF_FFFF_FFFF.  THIS is the value
+        // that, added to a non-zero host_base, overflows.
+        assert_eq!((-1_i32 as u64), 0xFFFF_FFFF_FFFF_FFFF);
+    }
+
+    /// `i32 as u32 as u64` truncates to 32 bits, then zero-extends.
+    /// This is the fix.
+    #[test]
+    fn i32_through_u32_to_u64_preserves_bit_pattern() {
+        // -1_i32 has bit-pattern 0xFFFF_FFFF; reinterpreting as u32
+        // and widening to u64 yields 0x0000_0000_FFFF_FFFF — bounded.
+        assert_eq!((-1_i32 as u32 as u64), 0x0000_0000_FFFF_FFFF);
+        // High-bit-set i32 values: 0x8000_0000_i32 (= i32::MIN)
+        // becomes 0x0000_0000_8000_0000_u64 (not 0xFFFF_FFFF_8000_0000).
+        assert_eq!(
+            (i32::MIN as u32 as u64),
+            0x0000_0000_8000_0000_u64,
+            "i32::MIN must zero-extend (not sign-extend) so high \
+             bit propagation does not overflow host_base + pointer"
+        );
+    }
+
+    /// `wrapping_add` on `host_base + (i32 as u32 as u64)` cannot panic.
+    /// In debug builds, ordinary `+` panics on overflow; `wrapping_add`
+    /// wraps silently.  The overflow can only occur if host_base is in
+    /// the upper few-GB of u64 range — implausible on modern hosts,
+    /// but `wrapping_add` is the right guard.
+    #[test]
+    fn wrapping_add_does_not_panic_on_max_inputs() {
+        let host_base: u64 = u64::MAX - 100;
+        let external_data: i32 = -1;
+        // Without wrapping_add this would panic in debug.  With it,
+        // we get a deterministic wraparound which is still a wrong
+        // pointer — but a `0` return value from the surrounding
+        // snapi_bridge_create_external_arraybuffer call surfaces that
+        // as a clean NAPI error to JS, not a host abort.
+        let host_addr = host_base.wrapping_add(external_data as u32 as u64);
+        // sanity-check the wrap-around arithmetic
+        let expected = host_base.wrapping_add(0xFFFF_FFFF);
+        assert_eq!(host_addr, expected);
+    }
 }

@@ -162,6 +162,34 @@ fn remember_host_buffer_copy(
     }
 }
 
+/// Register a *flush-only* `HostBufferCopy` for a guest buffer that is
+/// being re-resolved from an existing backing-store mapping (firebox#442).
+///
+/// Unlike [`remember_host_buffer_copy`], this does NOT touch
+/// `guest_data_backing_stores`: the mapping already exists and may
+/// describe a wider backing store than this particular resolution
+/// (e.g. a sub-view at a non-zero byte offset). Overwriting it with a
+/// possibly-offset `(host_addr, guest_ptr)` would corrupt later
+/// sub-view resolutions. This helper records ONLY the write-back
+/// instruction (`host_buffer_copies`) plus the volatile
+/// `guest_data_ptrs` alias keyed by the freshly-minted `handle_id`.
+fn register_host_buffer_copy_for_flush(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    handle_id: u32,
+    backing_store_token: u64,
+    guest_ptr: u32,
+    byte_len: usize,
+) {
+    let state = env.data_mut();
+    state.guest_data_ptrs.insert(handle_id, guest_ptr);
+    state.host_buffer_copies.push(crate::HostBufferCopy {
+        handle_id,
+        backing_store_token,
+        guest_ptr,
+        byte_len,
+    });
+}
+
 fn begin_host_buffer_method_frame(env: &mut FunctionEnvMut<NapiEnv>) {
     let start = env.data().host_buffer_copies.len();
     env.data_mut().host_buffer_method_frames.push(start);
@@ -183,6 +211,25 @@ fn resolve_current_host_data_to_guest(
     host_addr: u64,
     byte_len: usize,
 ) -> Option<u32> {
+    // Backing-store cache hit: a host buffer/typed-array previously
+    // snapshot-copied into guest memory is being re-resolved — typically
+    // a native binding (e.g. node's zlib `binding.Zlib`) re-reading the
+    // SAME V8 `Uint32Array` (`_writeState`) on every iteration of a
+    // synchronous loop. The V8 value handle (`handle_id`) is freshly
+    // minted by the bridge on every `napi_get_reference_value`, so it
+    // differs each call — but the `backing_store_token` is stable.
+    //
+    // firebox#442: the previous code returned the cached guest pointer
+    // here WITHOUT re-registering a `HostBufferCopy`. The native binding
+    // then wrote its results (post-`deflate` `avail_out`) into the guest
+    // copy, but there was no flush record, so the host V8 array was
+    // never updated past the FIRST resolution. node's
+    // `processChunkSync` `while (true)` loop read `_writeState[0] === 0`
+    // forever and exhausted all 4 GiB of linear memory. Re-registering
+    // a `HostBufferCopy` on every cache hit makes each re-resolution a
+    // flushable mutation: the native-method-return flush
+    // (`flush_host_buffer_copies_for_callback`) then writes the guest
+    // copy back to the live V8 array after every binding invocation.
     if backing_store_token != 0
         && let Some(mapping) = env
             .data()
@@ -191,9 +238,13 @@ fn resolve_current_host_data_to_guest(
         && let Some(guest_data_ptr) =
             resolve_guest_backing_store_mapping(mapping, host_addr, byte_len)
     {
-        env.data_mut()
-            .guest_data_ptrs
-            .insert(handle_id, guest_data_ptr);
+        register_host_buffer_copy_for_flush(
+            env,
+            handle_id,
+            backing_store_token,
+            guest_data_ptr,
+            byte_len,
+        );
         return Some(guest_data_ptr);
     }
     if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&handle_id) {

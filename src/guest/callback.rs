@@ -29,7 +29,37 @@ fn call_guest_callback(
         Value::FuncRef(None) => return 0,
         _ => return 0,
     };
-    match func.call(
+
+    // firebox#442 — native-method-return flush.
+    //
+    // `func` IS the guest WASM implementation of a native N-API method
+    // (e.g. node's zlib `binding.Zlib`'s `CompressionWriteSync`). When
+    // it reads its arguments via `napi_get_cb_info`, the bridge
+    // snapshot-COPIES any host V8 typed-array arguments into guest
+    // linear memory and records a `HostBufferCopy` write-back
+    // instruction; `napi_get_cb_info` also opens a "method frame"
+    // (`host_buffer_method_frames`). Guest mutations to those copies
+    // only reach the host V8 objects when the copies are flushed.
+    //
+    // The previous design flushed the method frame from exactly ONE
+    // napi entry point — `napi_create_int32`. A native method that
+    // returns `Undefined` (which `CompressionWriteSync` does) never
+    // calls `napi_create_int32`, so its typed-array mutations were
+    // never written back: node's `processChunkSync` `while (true)`
+    // loop read a stale `_writeState[0] === 0` forever and exhausted
+    // all 4 GiB of guest linear memory.
+    //
+    // The correct boundary is the native-method RETURN itself — every
+    // native N-API method passes through `call_guest_callback` exactly
+    // once. Bracketing the guest call here flushes every host-buffer
+    // copy registered during the method body, regardless of the
+    // method's return type, and discards any method frames the method
+    // opened but did not close. This removes the bug *class*.
+    let snapi_env = env.data().resolve_napi_env(guest_env);
+    let copies_before = env.data().host_buffer_copies.len();
+    let method_frames_before = env.data().host_buffer_method_frames.len();
+
+    let ret = match func.call(
         env,
         &[Value::I32(guest_env), Value::I32(callback_arg as i32)],
     ) {
@@ -42,7 +72,21 @@ fn call_guest_callback(
             eprintln!("[callback trampoline] error calling function: {err}");
             0
         }
+    };
+
+    // Flush host-buffer copies registered during this native method,
+    // then discard any method frames it left open. `flush_*_since`
+    // only drains copies at/after `copies_before`, so nested native
+    // callbacks (each of which runs through its own
+    // `call_guest_callback`) compose correctly.
+    if !snapi_env.is_null() {
+        flush_host_buffer_copies_since(env, snapi_env, copies_before);
     }
+    env.data_mut()
+        .host_buffer_method_frames
+        .truncate(method_frames_before);
+
+    ret
 }
 
 fn flush_host_buffer_copies(
@@ -135,6 +179,25 @@ pub fn with_callback_state<R>(
     if snapi_env.is_null() {
         return f();
     }
+
+    // firebox#442 — pre-call flush for the ASYNC zlib path.
+    //
+    // `with_callback_state` wraps every guest→V8 call (`napi_call_function`,
+    // property access that may trigger a JS accessor, etc.). When a native
+    // N-API method runs ASYNC work — node's zlib `binding.Zlib`'s
+    // `CompressionWrite` — it computes its result (writing the post-`inflate`
+    // `avail_out` into the `_writeState` typed array and the decompressed
+    // bytes into the output `Buffer`), and then, BEFORE returning, invokes
+    // the JS completion callback (`processCallback`) via `napi_call_function`.
+    // `processCallback` reads `_writeState[0]` and slices the output buffer.
+    //
+    // Those host objects are guest-memory SNAPSHOT COPIES; the guest's
+    // writes only reach the host V8 objects when the copies are flushed.
+    // The native-method-return flush (`call_guest_callback`) is too late
+    // here — the JS callback runs *inside* the still-executing native
+    // method. So flush every pending host-buffer copy NOW, before `f`
+    // re-enters V8, so the JS callback observes the guest's latest writes.
+    flush_pending_host_buffer_copies(env, snapi_env);
 
     let mut ctx = CallbackInvocationCtx {
         env: (env as *mut FunctionEnvMut<'_, NapiEnv>).cast::<RawFunctionEnvMut>(),

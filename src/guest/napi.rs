@@ -2205,6 +2205,40 @@ fn guest_napi_get_global(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i
 
 // --- Value creation ---
 
+// firebox#614: route raw guest bytes straight through to the bridge,
+// preserving embedded NUL bytes. The previous shape wrapped the input in
+// `CString::new(sb).unwrap_or_default()`, which `Err`'d for any input
+// containing an embedded NUL byte and substituted an empty CString. The
+// bridge was then called with `cs.as_ptr()` (pointing to a 1-byte
+// allocation that holds just the terminator) plus the ORIGINAL `wl` byte
+// count — V8's `String::NewFromUtf8(str, length=wl)` then read `wl` bytes
+// past the end of the empty CString and produced an all-NUL string of
+// length `wl`. Symptoms observed in firebox#610:
+//
+//   Buffer.from([65,66,0,67,68]).toString('utf8')   == "\0\0\0\0\0" (broken)
+//   Buffer.from([65,66,67]).toString('utf8')        == "ABC"        (correct;
+//                                                                    no embedded NUL,
+//                                                                    so CString::new
+//                                                                    succeeded)
+//
+// The bridge's `(str, wasm_length)` signature already accepts an explicit
+// byte count and does NOT require NUL termination — passing the raw
+// `sb.as_ptr()` (cast to `*const i8`) plus the actual byte length is the
+// correct, embedded-NUL-safe shape. For the auto-length path the Rust
+// side already discovered the byte length via `read_guest_c_string`
+// (which scans for the NUL terminator on the guest side and returns the
+// bytes WITHOUT the terminator); we pass that explicit length to the
+// bridge so the bridge no longer needs to call `strlen` on the host side
+// either.
+//
+// Class: this is the root-cause fix that retires
+// `MakeUtf8SafeString` in packages/edgejs/patches/buffer-utf8-wedge-fix.patch
+// (firebox#610). The same class-bug pattern appears at multiple other
+// `CString::new(...).unwrap_or_default()` callsites in this file (line
+// references: see firebox#614 task notes); those are safe in practice
+// today because the inputs are identifier-like (function names, property
+// names, error codes) that don't carry embedded NULs, but the pattern is
+// the wrong shape and should be audited as a follow-up.
 fn guest_napi_create_string_utf8(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2221,16 +2255,27 @@ fn guest_napi_create_string_utf8(
     let Some(sb) = sb else {
         return 1;
     };
-    let cs = CString::new(sb).unwrap_or_default();
+    let actual_len = sb.len() as u32;
     let mut out: u32 = 0;
-    let s =
-        unsafe { snapi_bridge_create_string_utf8(snapi_env(&env, e), cs.as_ptr(), wl, &mut out) };
+    let s = unsafe {
+        snapi_bridge_create_string_utf8(
+            snapi_env(&env, e),
+            sb.as_ptr() as *const i8,
+            actual_len,
+            &mut out,
+        )
+    };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
 
+// firebox#614: sibling fix to guest_napi_create_string_utf8 — see that
+// function's preamble for the full rationale. Latin-1 inputs can carry
+// embedded NUL bytes too (any byte 0x00..=0xFF is a valid latin-1
+// codepoint), so the CString-wrapping path was broken here for exactly
+// the same reasons.
 fn guest_napi_create_string_latin1(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2247,10 +2292,16 @@ fn guest_napi_create_string_latin1(
     let Some(sb) = sb else {
         return 1;
     };
-    let cs = CString::new(sb).unwrap_or_default();
+    let actual_len = sb.len() as u32;
     let mut out: u32 = 0;
-    let s =
-        unsafe { snapi_bridge_create_string_latin1(snapi_env(&env, e), cs.as_ptr(), wl, &mut out) };
+    let s = unsafe {
+        snapi_bridge_create_string_latin1(
+            snapi_env(&env, e),
+            sb.as_ptr() as *const i8,
+            actual_len,
+            &mut out,
+        )
+    };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }

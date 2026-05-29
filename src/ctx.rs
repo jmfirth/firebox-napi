@@ -263,6 +263,7 @@ impl NapiRuntimeHooks {
         store: &mut StoreMut<'_>,
         instance: &Instance,
         imported_memory: Option<&wasmer::Memory>,
+        imported_table: Option<&wasmer::Table>,
     ) -> Result<()> {
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
         if napi_version.is_none() && napi_extension_version.is_none() {
@@ -287,7 +288,7 @@ impl NapiRuntimeHooks {
             session
         };
 
-        session.configure_instance(store, instance, imported_memory)
+        session.configure_instance(store, instance, imported_memory, imported_table)
     }
 }
 
@@ -332,6 +333,7 @@ impl NapiSession {
         store: &mut StoreMut<'_>,
         instance: &Instance,
         imported_memory: Option<&wasmer::Memory>,
+        imported_table: Option<&wasmer::Table>,
     ) -> Result<()> {
         let func_env = {
             let guard = self
@@ -358,7 +360,30 @@ impl NapiSession {
             }
         }
 
-        if let Ok(table) = instance.exports.get_table("__indirect_function_table") {
+        // firebox#717: re-point the provider's `NapiEnv.table` onto the
+        // authoritative indirect function table — the symmetric partner of the
+        // firebox#714 `imported_memory` re-point above, for the function-table
+        // resource.
+        //
+        // Two instantiation shapes reach this:
+        //   * NON-DL (static main): the instance *exports*
+        //     `__indirect_function_table`, so the export lookup below succeeds
+        //     and binds the real table.
+        //   * DL (PIC dynamic-main): the instance *imports*
+        //     `env.__indirect_function_table` from the WASIX linker — it does
+        //     NOT export it. The export lookup fails, so without the linker
+        //     supplying `imported_table` the provider would keep the empty
+        //     placeholder `Table::new(.., FuncRef(None))` minted in
+        //     `create_imports`. Every host→guest N-API callback dispatch
+        //     (`call_guest_callback` -> `table.get(wasm_fn_ptr)`) would then
+        //     read `FuncRef(None)` and silently return 0, i.e. JS `undefined`
+        //     (the firebox#717 `internalBinding('builtins')` is undefined
+        //     symptom). The linker's authoritative table arrives via
+        //     `imported_table`; prefer it, then fall back to the export for the
+        //     static path.
+        if let Some(table) = imported_table {
+            func_env.as_mut(&mut *store).table = Some(table.clone());
+        } else if let Ok(table) = instance.exports.get_table("__indirect_function_table") {
             func_env.as_mut(&mut *store).table = Some(table.clone());
         }
         Ok(())

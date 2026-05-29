@@ -268,6 +268,20 @@ unsafe extern "C" {
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
+    // firebox#697: env-agnostic message-payload serialize/deserialize/release.
+    // `token` is a process-global handle into the host serialized-payload
+    // table (NOT a per-isolate napi_value), so it crosses V8 isolates safely.
+    pub fn snapi_bridge_unofficial_serialize_value(
+        env: SnapiEnv,
+        value_id: u32,
+        token_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_deserialize_value(
+        env: SnapiEnv,
+        token: u32,
+        out_id: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_release_serialized_value(token: u32);
     pub fn snapi_bridge_unofficial_notify_datetime_configuration_change(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_create_serdes_binding(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_unofficial_contextify_contains_module_syntax(

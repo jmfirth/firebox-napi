@@ -89,6 +89,19 @@ struct CallbackBinding {
 
 std::unordered_set<SnapiEnvState*> g_envs;
 
+// firebox#697: process-global table of env-AGNOSTIC serialized message
+// payloads. The MessagePort transfer queue carries these across V8 isolates
+// (e.g. parent -> worker_threads worker), so the token MUST NOT live in any
+// per-isolate SnapiEnvState — unlike napi_value handle ids, which are only
+// valid within their originating isolate. The guest stores the u32 token in
+// its QueuedMessage::payload_data; serialize runs v8::ValueSerializer on the
+// SOURCE isolate, deserialize runs v8::ValueDeserializer on the TARGET
+// isolate. (Before this fix the guest stub passed the napi_value handle id
+// through verbatim, so a worker deserialized a parent-isolate handle against
+// its own handle table -> garbage/null -> worker user script never ran.)
+std::unordered_map<uint32_t, void*> g_serialized_payloads;
+uint32_t g_next_serialized_payload_id = 1;
+
 CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) {
   if (state == nullptr || reg_id == 0) return nullptr;
   state->callback_bindings.push_back(
@@ -3252,6 +3265,62 @@ extern "C" int snapi_bridge_unofficial_structured_clone_with_transfer(
   if (s != napi_ok) return s;
   if (out_id != nullptr) *out_id = StoreValue(*bridge_state, result);
   return napi_ok;
+}
+
+// firebox#697: env-agnostic message-payload serialize/deserialize/release.
+// These wrap the real v8::ValueSerializer-backed unofficial_napi_serialize_value
+// (napi/v8/src/unofficial_napi.cc) and hand the guest a process-global u32
+// token rather than a per-isolate napi_value handle.
+extern "C" int snapi_bridge_unofficial_serialize_value(SnapiEnvState* env_state,
+                                                       uint32_t value_id,
+                                                       uint32_t* token_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || token_out == nullptr) return napi_invalid_arg;
+  *token_out = 0;
+  napi_env env = bridge_state->env;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  napi_value value = LoadValue(*bridge_state, value_id);
+  if (value == nullptr) return napi_invalid_arg;
+  void* payload = nullptr;
+  napi_status s = unofficial_napi_serialize_value(env, value, &payload);
+  if (s != napi_ok) return s;
+  if (payload == nullptr) return napi_generic_failure;
+  uint32_t token = g_next_serialized_payload_id++;
+  if (token == 0) token = g_next_serialized_payload_id++;  // never hand out 0
+  g_serialized_payloads[token] = payload;
+  *token_out = token;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_deserialize_value(SnapiEnvState* env_state,
+                                                         uint32_t token,
+                                                         uint32_t* out_id) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr || out_id == nullptr) return napi_invalid_arg;
+  *out_id = 0;
+  if (token == 0) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  auto it = g_serialized_payloads.find(token);
+  if (it == g_serialized_payloads.end() || it->second == nullptr) return napi_invalid_arg;
+  napi_value result = nullptr;
+  napi_status s = unofficial_napi_deserialize_value(env, it->second, &result);
+  if (s != napi_ok) return s;
+  if (result == nullptr) return napi_generic_failure;
+  *out_id = StoreValue(*bridge_state, result);
+  return napi_ok;
+}
+
+extern "C" void snapi_bridge_unofficial_release_serialized_value(uint32_t token) {
+  if (token == 0) return;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  auto it = g_serialized_payloads.find(token);
+  if (it == g_serialized_payloads.end()) return;
+  void* payload = it->second;
+  g_serialized_payloads.erase(it);
+  if (payload != nullptr) {
+    unofficial_napi_release_serialized_value(payload);
+  }
 }
 
 extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(

@@ -787,29 +787,54 @@ fn guest_unofficial_napi_structured_clone_with_transfer(
 
 fn guest_unofficial_napi_serialize_value(
     mut env: FunctionEnvMut<NapiEnv>,
-    _napi_env: i32,
+    napi_env: i32,
     value: i32,
     payload_out_ptr: i32,
 ) -> i32 {
-    if payload_out_ptr > 0 {
-        write_guest_u32(&mut env, payload_out_ptr as u32, value.max(0) as u32);
+    // firebox#697: serialize the value to an env-AGNOSTIC payload via the
+    // host v8::ValueSerializer, returning a process-global token. The previous
+    // identity-passthrough (payload = napi_value handle id) was only valid for
+    // same-isolate MessageChannels; cross-isolate (worker_threads) delivery
+    // handed the worker a parent-isolate handle id, which it resolved against
+    // its own handle table -> wrong/null value -> worker user script never ran.
+    let env_handle = snapi_env(&env, napi_env);
+    let value_id = if value > 0 { value as u32 } else { 0 };
+    let mut token = 0u32;
+    let status =
+        unsafe { snapi_bridge_unofficial_serialize_value(env_handle, value_id, &mut token) };
+    if status == 0 && payload_out_ptr > 0 {
+        write_guest_u32(&mut env, payload_out_ptr as u32, token);
     }
-    0
+    status
 }
 
 fn guest_unofficial_napi_deserialize_value(
     mut env: FunctionEnvMut<NapiEnv>,
-    _napi_env: i32,
+    napi_env: i32,
     payload: i32,
     result_out_ptr: i32,
 ) -> i32 {
-    if result_out_ptr > 0 {
-        write_guest_u32(&mut env, result_out_ptr as u32, payload.max(0) as u32);
+    // firebox#697: reconstruct the value from the env-agnostic payload token
+    // via the host v8::ValueDeserializer on the TARGET isolate, minting a fresh
+    // napi_value handle in the caller's (target) handle table.
+    let env_handle = snapi_env(&env, napi_env);
+    let token = if payload > 0 { payload as u32 } else { 0 };
+    let mut out = 0u32;
+    let status =
+        unsafe { snapi_bridge_unofficial_deserialize_value(env_handle, token, &mut out) };
+    if status == 0 && result_out_ptr > 0 {
+        write_guest_u32(&mut env, result_out_ptr as u32, out);
     }
-    0
+    status
 }
 
-fn guest_unofficial_napi_release_serialized_value(_env: FunctionEnvMut<NapiEnv>, _payload: i32) {}
+fn guest_unofficial_napi_release_serialized_value(_env: FunctionEnvMut<NapiEnv>, payload: i32) {
+    // firebox#697: free the host serialized payload behind the token.
+    let token = if payload > 0 { payload as u32 } else { 0 };
+    if token != 0 {
+        unsafe { snapi_bridge_unofficial_release_serialized_value(token) };
+    }
+}
 
 fn guest_unofficial_napi_enqueue_microtask(
     env: FunctionEnvMut<NapiEnv>,

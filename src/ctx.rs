@@ -45,6 +45,27 @@ pub struct NapiRuntimeHooks {
 struct NapiCtxInner {
     limits: NapiLimits,
     active_sessions: AtomicUsize,
+    /// Process-global monotonic counters for guest-visible `napi_env` /
+    /// N-API scope handles (firebox#684).
+    ///
+    /// Each WASIX guest thread instantiates the Edge.js module with its
+    /// own per-instance [`NapiSession`] and therefore its own
+    /// per-thread [`NapiEnv`] host state.  WASIX threads share the same
+    /// guest *linear memory*, so the small-integer `napi_env` / scope
+    /// handles that the bridge writes back into guest memory are visible
+    /// across threads.  Edge.js keys per-environment state (its
+    /// `g_environments` map, the worker registry, the platform-task
+    /// `owning_thread`) on that integer.  If two threads each minted
+    /// handle `1` from independent per-`NapiEnv` counters, the parent
+    /// env and a `worker_threads` worker env collided on the same key —
+    /// the worker thread then drove the *parent's* platform-task state,
+    /// tripping `AssertOwningThread` and hard-aborting the runtime.
+    ///
+    /// Hoisting the counters to the process-global `NapiCtx` (one per
+    /// firebox process; see `napi_v8::ctx()`) makes every handle unique
+    /// across all threads that share guest memory, so the guest-side
+    /// per-env keying stays unambiguous.
+    handle_ids: Arc<crate::env::NapiHandleIds>,
 }
 
 struct NapiSessionInner {
@@ -92,6 +113,7 @@ impl NapiCtxBuilder {
             inner: Arc::new(NapiCtxInner {
                 limits: self.limits,
                 active_sessions: AtomicUsize::new(0),
+                handle_ids: Arc::new(crate::env::NapiHandleIds::default()),
             }),
         }
     }
@@ -274,7 +296,12 @@ impl NapiSession {
         let mut import_object = Imports::new();
         register_env_imports(store, &mut import_object);
 
-        let func_env = FunctionEnv::new(store, NapiEnv::default());
+        // firebox#684: seed this per-thread NapiEnv with the process-global
+        // handle-id counters so guest-visible napi_env / scope handles are
+        // unique across every WASIX thread that shares guest memory.
+        let mut napi_env = NapiEnv::default();
+        napi_env.handle_ids = Arc::clone(&self.inner.ctx.handle_ids);
+        let func_env = FunctionEnv::new(store, napi_env);
         {
             let mut guard = self
                 .inner

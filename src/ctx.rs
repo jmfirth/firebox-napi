@@ -4,7 +4,9 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
+use wasmer::{
+    ExternType, Function, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value,
+};
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
@@ -264,6 +266,7 @@ impl NapiRuntimeHooks {
         instance: &Instance,
         imported_memory: Option<&wasmer::Memory>,
         imported_table: Option<&wasmer::Table>,
+        imported_malloc: Option<&Function>,
     ) -> Result<()> {
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
         if napi_version.is_none() && napi_extension_version.is_none() {
@@ -288,7 +291,13 @@ impl NapiRuntimeHooks {
             session
         };
 
-        session.configure_instance(store, instance, imported_memory, imported_table)
+        session.configure_instance(
+            store,
+            instance,
+            imported_memory,
+            imported_table,
+            imported_malloc,
+        )
     }
 }
 
@@ -334,6 +343,7 @@ impl NapiSession {
         instance: &Instance,
         imported_memory: Option<&wasmer::Memory>,
         imported_table: Option<&wasmer::Table>,
+        imported_malloc: Option<&Function>,
     ) -> Result<()> {
         let func_env = {
             let guard = self
@@ -350,13 +360,47 @@ impl NapiSession {
             func_env.as_mut(&mut *store).memory = Some(memory.clone());
         }
 
-        for export_name in ["unofficial_napi_guest_malloc", "malloc"] {
-            if let Ok(malloc) = instance
-                .exports
-                .get_typed_function::<i32, i32>(&store, export_name)
-            {
-                func_env.as_mut(&mut *store).malloc_fn = Some(malloc);
-                break;
+        // firebox#MDA: bind the guest allocator, preferring the one the DL
+        // linker resolved over the main instance's own exports.
+        //
+        // Three instantiation shapes reach this, and only the first two are
+        // served by an export lookup:
+        //   * NON-DL (static main) and FAT PIC main: libc is linked into the
+        //     main module, so the instance *exports* `malloc` (and, for an
+        //     Edge.js-style build, the `unofficial_napi_guest_malloc` wrapper).
+        //     The export lookup below binds the real allocator.
+        //   * DL THIN main (Route C): libc is a *side module* named in
+        //     `NEEDED`. The main *imports* `env.malloc` and exports NEITHER
+        //     name, so the export lookup finds nothing and `malloc_fn` stays
+        //     `None`. Every host-side guest allocation
+        //     (`napi_create_arraybuffer`, `napi_create_buffer`,
+        //     `napi_create_buffer_copy`, `napi_get_node_version`) then takes
+        //     its host-memory fallback and cannot hand the guest back an
+        //     addressable `void** data` — Edge.js's `InstallShouldAbortToggle`
+        //     reads `data == nullptr`, `internalBinding('util')` comes back
+        //     `undefined`, and Node's bootstrap dies destructuring
+        //     `privateSymbols`.
+        //
+        // The linker supplies `imported_malloc` by resolving the symbol across
+        // the whole link graph — the same resolution the guest's own
+        // `env.malloc` import went through — so the provider calls the very
+        // allocator the guest calls. This is the third member of the
+        // firebox#714 (`env.memory`) / firebox#717
+        // (`env.__indirect_function_table`) family: a host-provider resource a
+        // DL main imports rather than exports.
+        let linker_malloc =
+            imported_malloc.and_then(|malloc| malloc.typed::<i32, i32>(&store).ok());
+        if let Some(malloc) = linker_malloc {
+            func_env.as_mut(&mut *store).malloc_fn = Some(malloc);
+        } else {
+            for export_name in ["unofficial_napi_guest_malloc", "malloc"] {
+                if let Ok(malloc) = instance
+                    .exports
+                    .get_typed_function::<i32, i32>(&store, export_name)
+                {
+                    func_env.as_mut(&mut *store).malloc_fn = Some(malloc);
+                    break;
+                }
             }
         }
 

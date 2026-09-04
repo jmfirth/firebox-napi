@@ -820,8 +820,7 @@ fn guest_unofficial_napi_deserialize_value(
     let env_handle = snapi_env(&env, napi_env);
     let token = if payload > 0 { payload as u32 } else { 0 };
     let mut out = 0u32;
-    let status =
-        unsafe { snapi_bridge_unofficial_deserialize_value(env_handle, token, &mut out) };
+    let status = unsafe { snapi_bridge_unofficial_deserialize_value(env_handle, token, &mut out) };
     if status == 0 && result_out_ptr > 0 {
         write_guest_u32(&mut env, result_out_ptr as u32, out);
     }
@@ -3190,6 +3189,23 @@ fn guest_napi_reject_deferred(env: FunctionEnvMut<NapiEnv>, e: i32, d: i32, v: i
 
 // --- ArrayBuffer ---
 
+/// `napi_generic_failure` (`js_native_api_types.h`, the 10th `napi_status`).
+///
+/// firebox#MDA: the honest answer when the host bridge cannot satisfy an
+/// entry point's contract. Four entry points below allocate guest-visible
+/// memory through the guest's own allocator and write the resulting guest
+/// pointer into a caller-supplied out-parameter. When no guest allocator is
+/// bound they fall back to a HOST-memory-backed object, whose address the
+/// guest cannot address, dereference or free — so the out-parameter cannot be
+/// written. Returning `napi_ok` with that out-parameter untouched is a false
+/// success: it leaves the caller's `void* data` at whatever it held (usually
+/// `nullptr`) while telling it the call worked, and the resulting damage
+/// surfaces layers away with nothing pointing back here. That is how a missing
+/// allocator on a Route C thin main became `internalBinding('util')` being
+/// `undefined` inside Node's bootstrap. An honest failure is faithful; a false
+/// success never is.
+const NAPI_GENERIC_FAILURE: i32 = 9;
+
 fn guest_napi_create_arraybuffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3207,7 +3223,9 @@ fn guest_napi_create_arraybuffer(
             let (_, mut store_ref) = env.data_and_store_mut();
             match malloc_fn.call(&mut store_ref, byte_length) {
                 Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1, // allocation failed
+                // firebox#MDA: an allocation failure is a generic failure, not
+                // an invalid argument — the arguments were fine.
+                _ => return NAPI_GENERIC_FAILURE,
             }
         };
 
@@ -3253,7 +3271,16 @@ fn guest_napi_create_arraybuffer(
         }
         s
     } else {
-        // Fallback: host-memory-backed arraybuffer (non-WASIX path)
+        // Fallback: host-memory-backed arraybuffer (non-WASIX path).
+        //
+        // firebox#MDA: legitimate ONLY when the caller did not ask for the
+        // data pointer. A host-backed backing store has no guest address, so
+        // with `data_ptr != 0` there is nothing truthful to write there and
+        // the call must fail rather than report success over an untouched
+        // out-parameter. See `NAPI_GENERIC_FAILURE`.
+        if data_ptr > 0 {
+            return NAPI_GENERIC_FAILURE;
+        }
         let mut out: u32 = 0;
         let s = unsafe {
             snapi_bridge_create_arraybuffer(snapi_env(&env, e), byte_length as u32, &mut out)
@@ -4641,7 +4668,8 @@ fn guest_napi_create_buffer(
             let (_, mut store_ref) = env.data_and_store_mut();
             match malloc_fn.call(&mut store_ref, length) {
                 Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1,
+                // firebox#MDA: allocation failure is a generic failure.
+                _ => return NAPI_GENERIC_FAILURE,
             }
         };
 
@@ -4689,7 +4717,15 @@ fn guest_napi_create_buffer(
         }
         0
     } else {
-        // Fallback for non-WASIX: use bridge directly
+        // Fallback for non-WASIX: use bridge directly.
+        //
+        // firebox#MDA: as in `guest_napi_create_arraybuffer`, the host-backed
+        // buffer has no guest address, so a caller that asked for `data` cannot
+        // be answered truthfully. Fail instead of returning `napi_ok` over an
+        // untouched out-parameter.
+        if data_ptr > 0 {
+            return NAPI_GENERIC_FAILURE;
+        }
         let mut host_data: u64 = 0;
         let mut out: u32 = 0;
         let s = unsafe {
@@ -4725,7 +4761,8 @@ fn guest_napi_create_buffer_copy(
             let (_, mut store_ref) = env.data_and_store_mut();
             match malloc_fn.call(&mut store_ref, length) {
                 Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1,
+                // firebox#MDA: allocation failure is a generic failure.
+                _ => return NAPI_GENERIC_FAILURE,
             }
         };
 
@@ -4770,7 +4807,13 @@ fn guest_napi_create_buffer_copy(
         }
         0
     } else {
-        // Fallback for non-WASIX
+        // Fallback for non-WASIX.
+        //
+        // firebox#MDA: same contract as the two above — `result_data_ptr` asks
+        // for a guest address the host-backed copy does not have.
+        if result_data_ptr > 0 {
+            return NAPI_GENERIC_FAILURE;
+        }
         let mut result_host_data: u64 = 0;
         let mut out: u32 = 0;
         let s = unsafe {
@@ -4861,7 +4904,8 @@ fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32
             let (_, mut store_ref) = env.data_and_store_mut();
             match malloc_fn.call(&mut store_ref, total) {
                 Ok(ptr) if ptr > 0 => ptr,
-                _ => return 1,
+                // firebox#MDA: allocation failure is a generic failure.
+                _ => return NAPI_GENERIC_FAILURE,
             }
         };
         // Write release string
@@ -4875,8 +4919,13 @@ fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32
         // Write pointer to struct
         write_guest_u32(&mut env, rp as u32, guest_ptr as u32);
     } else {
-        // Fallback: just write major version as a simple value
-        write_guest_u32(&mut env, rp as u32, major);
+        // firebox#MDA: there is no fallback here to be honest about. The
+        // out-parameter is a `const napi_node_version**` — a POINTER to a
+        // struct in GUEST memory — and without a guest allocator no such struct
+        // can exist. The former fallback wrote the raw `major` number into the
+        // pointer slot and returned `napi_ok`, handing the caller an address
+        // like `20` that it would then dereference. Fail instead.
+        return NAPI_GENERIC_FAILURE;
     }
     0
 }
@@ -5527,10 +5576,7 @@ pub fn register_napi_imports(
     // directly. Without this bridge, edgejs.webc fails to instantiate
     // with `Error while importing "napi"."unofficial_napi_create_env":
     // unknown import`.
-    io.register_namespace(
-        NAPI_MODULE_NAME,
-        napi_extension_wasmer_namespace.clone(),
-    );
+    io.register_namespace(NAPI_MODULE_NAME, napi_extension_wasmer_namespace.clone());
     io.register_namespace(
         NAPI_EXTENSION_WASMER_MODULE_NAME,
         napi_extension_wasmer_namespace,
